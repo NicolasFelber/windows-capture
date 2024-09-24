@@ -514,6 +514,13 @@ pub struct VideoEncoder {
     error_notify: Arc<AtomicBool>,
     is_video_disabled: bool,
     is_audio_disabled: bool,
+    transcoder_properties: TranscoderProperties,
+}
+
+struct TranscoderProperties {
+    media_stream_source: MediaStreamSource,
+    media_stream_output: IRandomAccessStream,
+    media_encoding_profile: MediaEncodingProfile,
 }
 
 impl VideoEncoder {
@@ -702,6 +709,12 @@ impl VideoEncoder {
         let file = StorageFile::GetFileFromPathAsync(path)?.get()?;
         let media_stream_output = file.OpenAsync(FileAccessMode::ReadWrite)?.get()?;
 
+        let transcoder_properties = TranscoderProperties {
+            media_stream_source,
+            media_stream_output,
+            media_encoding_profile,
+        };
+
         let transcode = media_transcoder
             .PrepareMediaStreamSourceTranscodeAsync(
                 &media_stream_source,
@@ -742,7 +755,55 @@ impl VideoEncoder {
             error_notify,
             is_video_disabled,
             is_audio_disabled,
+            transcoder_properties,
         })
+    }
+
+    pub fn change_path<P: AsRef<Path>>(self, path: P) -> Result<(), VideoEncoderError> {
+        self.finish();
+
+        let path = path.as_ref();
+        let media_transcoder = MediaTranscoder::new()?;
+
+        media_transcoder.SetHardwareAccelerationEnabled(true)?;
+
+        File::create(path)?;
+        let path = fs::canonicalize(path).unwrap().to_string_lossy()[4..].to_string();
+        let path = Path::new(&path);
+
+        let path = &HSTRING::from(path.as_os_str().to_os_string());
+
+        let file = StorageFile::GetFileFromPathAsync(path)?.get()?;
+        let media_stream_output = file.OpenAsync(FileAccessMode::ReadWrite)?.get()?;
+
+        let transcode = media_transcoder
+            .PrepareMediaStreamSourceTranscodeAsync(
+                &self.transcoder_properties.media_stream_source,
+                &media_stream_output,
+                &self.transcoder_properties.media_encoding_profile,
+            )?
+            .get()?;
+
+        let error_notify = Arc::new(AtomicBool::new(false));
+        let transcode_thread = thread::spawn({
+            let error_notify = error_notify.clone();
+
+            move || -> Result<(), VideoEncoderError> {
+                let result = transcode.TranscodeAsync();
+
+                if result.is_err() {
+                    error_notify.store(true, atomic::Ordering::Relaxed);
+                }
+
+                result?.get()?;
+
+                drop(media_transcoder);
+
+                Ok(())
+            }
+        });
+
+        Ok(())
     }
 
     /// Creates a new `VideoEncoder` instance with the specified parameters.
@@ -920,6 +981,12 @@ impl VideoEncoder {
         let media_transcoder = MediaTranscoder::new()?;
         media_transcoder.SetHardwareAccelerationEnabled(true)?;
 
+        let transcoder_properties = TranscoderProperties {
+            media_stream_source,
+            media_stream_output: stream,
+            media_encoding_profile,
+        };
+
         let transcode = media_transcoder
             .PrepareMediaStreamSourceTranscodeAsync(
                 &media_stream_source,
@@ -960,6 +1027,7 @@ impl VideoEncoder {
             error_notify,
             is_video_disabled,
             is_audio_disabled,
+            transcoder_properties,
         })
     }
 
