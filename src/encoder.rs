@@ -514,14 +514,9 @@ pub struct VideoEncoder {
     error_notify: Arc<AtomicBool>,
     is_video_disabled: bool,
     is_audio_disabled: bool,
-    transcoder_properties: TranscoderProperties,
+    encoding_profile: MediaEncodingProfile,
 }
 
-struct TranscoderProperties {
-    media_stream_source: MediaStreamSource,
-    media_stream_output: IRandomAccessStream,
-    media_encoding_profile: MediaEncodingProfile,
-}
 
 impl VideoEncoder {
     /// Creates a new `VideoEncoder` instance with the specified parameters.
@@ -709,11 +704,7 @@ impl VideoEncoder {
         let file = StorageFile::GetFileFromPathAsync(path)?.get()?;
         let media_stream_output = file.OpenAsync(FileAccessMode::ReadWrite)?.get()?;
 
-        let transcoder_properties = TranscoderProperties {
-            media_stream_source,
-            media_stream_output,
-            media_encoding_profile,
-        };
+        let a = media_encoding_profile.clone();
 
         let transcode = media_transcoder
             .PrepareMediaStreamSourceTranscodeAsync(
@@ -755,17 +746,63 @@ impl VideoEncoder {
             error_notify,
             is_video_disabled,
             is_audio_disabled,
-            transcoder_properties,
+            encoding_profile: a,
         })
     }
 
-    pub fn change_path<P: AsRef<Path>>(self, path: P) -> Result<(), VideoEncoderError> {
-        self.finish();
+    pub fn change_path<P: AsRef<Path>>(&mut self,
+                                       video_settings: VideoSettingsBuilder,
+                                       audio_settings: AudioSettingsBuilder,
+                                       container_settings: ContainerSettingsBuilder,
+                                       path: P,) -> Result<(), VideoEncoderError> {
+        self.finish_no_drop()?;
 
         let path = path.as_ref();
         let media_transcoder = MediaTranscoder::new()?;
+        let media_encoding_profile = self.encoding_profile.clone();
 
         media_transcoder.SetHardwareAccelerationEnabled(true)?;
+
+        let (video_encoding_properties, is_video_disabled) = video_settings.build()?;
+        media_encoding_profile.SetVideo(&video_encoding_properties)?;
+        let (audio_encoding_properties, is_audio_disabled) = audio_settings.build()?;
+        media_encoding_profile.SetAudio(&audio_encoding_properties)?;
+        let container_encoding_properties = container_settings.build()?;
+        media_encoding_profile.SetContainer(&container_encoding_properties)?;
+
+        let video_encoding_properties = VideoEncodingProperties::CreateUncompressed(
+            &MediaEncodingSubtypes::Bgra8()?,
+            video_encoding_properties.Width()?,
+            video_encoding_properties.Height()?,
+        )?;
+        let video_stream_descriptor = VideoStreamDescriptor::Create(&video_encoding_properties)?;
+
+        let audio_encoding_properties = AudioEncodingProperties::CreateAac(
+            audio_encoding_properties.SampleRate()?,
+            audio_encoding_properties.ChannelCount()?,
+            audio_encoding_properties.Bitrate()?,
+        )?;
+        let audio_stream_descriptor = AudioStreamDescriptor::Create(&audio_encoding_properties)?;
+
+        let media_stream_source = MediaStreamSource::CreateFromDescriptors(
+            &video_stream_descriptor,
+            &audio_stream_descriptor,
+        )?;
+        media_stream_source.SetBufferTime(TimeSpan::default())?;
+
+        let starting = media_stream_source.Starting(&TypedEventHandler::<
+            MediaStreamSource,
+            MediaStreamSourceStartingEventArgs,
+        >::new(move |_, stream_start| {
+            let stream_start = stream_start
+                .as_ref()
+                .expect("MediaStreamSource Starting parameter was None This Should Not Happen.");
+
+            stream_start
+                .Request()?
+                .SetActualStartPosition(TimeSpan { Duration: 0 })?;
+            Ok(())
+        }))?;
 
         File::create(path)?;
         let path = fs::canonicalize(path).unwrap().to_string_lossy()[4..].to_string();
@@ -778,9 +815,9 @@ impl VideoEncoder {
 
         let transcode = media_transcoder
             .PrepareMediaStreamSourceTranscodeAsync(
-                &self.transcoder_properties.media_stream_source,
+                &media_stream_source,
                 &media_stream_output,
-                &self.transcoder_properties.media_encoding_profile,
+                &media_encoding_profile,
             )?
             .get()?;
 
@@ -981,11 +1018,7 @@ impl VideoEncoder {
         let media_transcoder = MediaTranscoder::new()?;
         media_transcoder.SetHardwareAccelerationEnabled(true)?;
 
-        let transcoder_properties = TranscoderProperties {
-            media_stream_source,
-            media_stream_output: stream,
-            media_encoding_profile,
-        };
+        let a = media_encoding_profile.clone();
 
         let transcode = media_transcoder
             .PrepareMediaStreamSourceTranscodeAsync(
@@ -1027,7 +1060,7 @@ impl VideoEncoder {
             error_notify,
             is_video_disabled,
             is_audio_disabled,
-            transcoder_properties,
+            encoding_profile: a,
         })
     }
 
@@ -1302,6 +1335,23 @@ impl VideoEncoder {
             .RemoveSampleRequested(self.sample_requested)?;
 
         Ok(())
+    }
+
+    fn finish_no_drop(&mut self) -> Result<Self, VideoEncoderError> {
+        self.frame_sender.send(None)?;
+        self.audio_sender.send(None)?;
+
+        if let Some(transcode_thread) = self.transcode_thread.take() {
+            transcode_thread
+                .join()
+                .expect("Failed to join transcode thread")?;
+        }
+
+        self.media_stream_source.RemoveStarting(self.starting)?;
+        self.media_stream_source
+            .RemoveSampleRequested(self.sample_requested)?;
+
+        Ok(Self)
     }
 }
 
