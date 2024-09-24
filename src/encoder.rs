@@ -1337,7 +1337,7 @@ impl VideoEncoder {
         Ok(())
     }
 
-    fn finish_no_drop(&mut self) -> Result<Self, VideoEncoderError> {
+    fn finish_no_drop(&mut self) -> Result<(), VideoEncoderError> {
         self.frame_sender.send(None)?;
         self.audio_sender.send(None)?;
 
@@ -1351,7 +1351,7 @@ impl VideoEncoder {
         self.media_stream_source
             .RemoveSampleRequested(self.sample_requested)?;
 
-        Ok(Self)
+        Ok(())
     }
 }
 
