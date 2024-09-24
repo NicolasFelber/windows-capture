@@ -756,17 +756,10 @@ impl VideoEncoder {
                                        container_settings: ContainerSettingsBuilder,
                                        path: P,) -> Result<(), VideoEncoderError> {
         let path = path.as_ref();
-        let media_transcoder = MediaTranscoder::new()?;
-        let media_encoding_profile = self.encoding_profile.clone();
-
-        media_transcoder.SetHardwareAccelerationEnabled(true)?;
 
         let (video_encoding_properties, is_video_disabled) = video_settings.build()?;
-        media_encoding_profile.SetVideo(&video_encoding_properties)?;
         let (audio_encoding_properties, is_audio_disabled) = audio_settings.build()?;
-        media_encoding_profile.SetAudio(&audio_encoding_properties)?;
         let container_encoding_properties = container_settings.build()?;
-        media_encoding_profile.SetContainer(&container_encoding_properties)?;
 
         let video_encoding_properties = VideoEncodingProperties::CreateUncompressed(
             &MediaEncodingSubtypes::Bgra8()?,
@@ -802,6 +795,117 @@ impl VideoEncoder {
             Ok(())
         }))?;
 
+        let (frame_sender, frame_receiver) =
+            mpsc::channel::<Option<(VideoEncoderSource, TimeSpan)>>();
+
+        let (audio_sender, audio_receiver) =
+            mpsc::channel::<Option<(AudioEncoderSource, TimeSpan)>>();
+
+        let frame_notify = Arc::new((Mutex::new(false), Condvar::new()));
+        let audio_notify = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let sample_requested = media_stream_source.SampleRequested(&TypedEventHandler::<
+            MediaStreamSource,
+            MediaStreamSourceSampleRequestedEventArgs,
+        >::new({
+            let frame_receiver = frame_receiver;
+            let frame_notify = frame_notify.clone();
+
+            let audio_receiver = audio_receiver;
+            let audio_notify = audio_notify.clone();
+
+            move |_, sample_requested| {
+                let sample_requested = sample_requested.as_ref().expect(
+                    "MediaStreamSource SampleRequested parameter was None This Should Not Happen.",
+                );
+
+                if sample_requested
+                    .Request()?
+                    .StreamDescriptor()?
+                    .GetRuntimeClassName()?
+                    == "Windows.Media.Core.AudioStreamDescriptor"
+                {
+                    if is_audio_disabled {
+                        sample_requested.Request()?.SetSample(None)?;
+
+                        return Ok(());
+                    }
+
+                    let audio = match audio_receiver.recv() {
+                        Ok(audio) => audio,
+                        Err(e) => panic!("Failed to receive audio from audio sender: {e}"),
+                    };
+
+                    match audio {
+                        Some((source, timespan)) => {
+                            let sample = match source {
+                                AudioEncoderSource::Buffer(buffer_data) => {
+                                    let buffer = buffer_data.0;
+                                    let buffer =
+                                        unsafe { slice::from_raw_parts(buffer.0, buffer_data.1) };
+                                    let buffer = CryptographicBuffer::CreateFromByteArray(buffer)?;
+                                    MediaStreamSample::CreateFromBuffer(&buffer, timespan)?
+                                }
+                            };
+
+                            sample_requested.Request()?.SetSample(&sample)?;
+                        }
+                        None => {
+                            sample_requested.Request()?.SetSample(None)?;
+                        }
+                    }
+
+                    let (lock, cvar) = &*audio_notify;
+                    *lock.lock() = true;
+                    cvar.notify_one();
+                } else {
+                    if is_video_disabled {
+                        sample_requested.Request()?.SetSample(None)?;
+
+                        return Ok(());
+                    }
+
+                    let frame = match frame_receiver.recv() {
+                        Ok(frame) => frame,
+                        Err(e) => panic!("Failed to receive frame from frame sender: {e}"),
+                    };
+
+                    match frame {
+                        Some((source, timespan)) => {
+                            let sample = match source {
+                                VideoEncoderSource::DirectX(surface) => {
+                                    MediaStreamSample::CreateFromDirect3D11Surface(
+                                        &surface.0, timespan,
+                                    )?
+                                }
+                                VideoEncoderSource::Buffer(buffer_data) => {
+                                    let buffer = buffer_data.0;
+                                    let buffer =
+                                        unsafe { slice::from_raw_parts(buffer.0, buffer_data.1) };
+                                    let buffer = CryptographicBuffer::CreateFromByteArray(buffer)?;
+                                    MediaStreamSample::CreateFromBuffer(&buffer, timespan)?
+                                }
+                            };
+
+                            sample_requested.Request()?.SetSample(&sample)?;
+                        }
+                        None => {
+                            sample_requested.Request()?.SetSample(None)?;
+                        }
+                    }
+
+                    let (lock, cvar) = &*frame_notify;
+                    *lock.lock() = true;
+                    cvar.notify_one();
+                }
+
+                Ok(())
+            }
+        }))?;
+
+        let media_transcoder = MediaTranscoder::new()?;
+        media_transcoder.SetHardwareAccelerationEnabled(true)?;
+
         File::create(path)?;
         let path = fs::canonicalize(path).unwrap().to_string_lossy()[4..].to_string();
         let path = Path::new(&path);
@@ -810,6 +914,8 @@ impl VideoEncoder {
 
         let file = StorageFile::GetFileFromPathAsync(path)?.get()?;
         let media_stream_output = file.OpenAsync(FileAccessMode::ReadWrite)?.get()?;
+
+        let media_encoding_profile = self.encoding_profile.clone();
 
         let transcode = media_transcoder
             .PrepareMediaStreamSourceTranscodeAsync(
@@ -837,6 +943,13 @@ impl VideoEncoder {
                 Ok(())
             }
         });
+
+        self.frame_sender = frame_sender;
+        self.media_stream_source = media_stream_source;
+        self.audio_sender = audio_sender;
+        self.transcode_thread = Some(transcode_thread);
+        self.sample_requested = sample_requested;
+        self.error_notify = error_notify;
 
         Ok(())
     }
