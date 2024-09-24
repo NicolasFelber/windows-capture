@@ -755,8 +755,6 @@ impl VideoEncoder {
                                        audio_settings: AudioSettingsBuilder,
                                        container_settings: ContainerSettingsBuilder,
                                        path: P,) -> Result<(), VideoEncoderError> {
-        self.finish_no_drop()?;
-
         let path = path.as_ref();
         let media_transcoder = MediaTranscoder::new()?;
         let media_encoding_profile = self.encoding_profile.clone();
