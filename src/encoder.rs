@@ -501,7 +501,6 @@ impl ContainerSettingsSubType {
 }
 
 /// The `VideoEncoder` struct represents a video encoder that can be used to encode video frames and save them to a specified file path.
-#[derive(Clone)]
 pub struct VideoEncoder {
     first_timespan: Option<TimeSpan>,
     frame_sender: mpsc::Sender<Option<(VideoEncoderSource, TimeSpan)>>,
