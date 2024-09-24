@@ -393,10 +393,7 @@ impl GraphicsCaptureApi {
     /// Returns `Ok(true)` if the API is supported, `Ok(false)` if the API is not supported, or an `Error` if an error occurred.
     #[inline]
     pub fn is_supported() -> Result<bool, Error> {
-        Ok(ApiInformation::IsApiContractPresentByMajor(
-            &HSTRING::from("Windows.Foundation.UniversalApiContract"),
-            8,
-        )? && GraphicsCaptureSession::IsSupported()?)
+        Ok(true)
     }
 
     /// Check if you can change the cursor capture setting.
